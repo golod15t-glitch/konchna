@@ -12,8 +12,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ========== Конфигурация ==========
-BOT_TOKEN =  "8462854362:AAH-XjFe0I51z9oFQMEvGwpJes-TV08gQWw"               #os.getenv("BOT_TOKEN")
-ADMIN_ID =   8206605553                         #os.getenv("ADMIN_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID =  os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("Не заданы переменные окружения BOT_TOKEN или ADMIN_ID")
@@ -162,4 +162,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+
     asyncio.run(main())
