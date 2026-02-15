@@ -13,7 +13,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # ========== Конфигурация ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID =  os.getenv("ADMIN_ID")
+ADMIN_ID = 8206605553  #os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("Не заданы переменные окружения BOT_TOKEN или ADMIN_ID")
@@ -164,3 +164,4 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
