@@ -1,19 +1,23 @@
 import os
+import json
 import random
 import string
 import logging
 import asyncio
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
 # ========== Конфигурация ==========
-BOT_TOKEN =  os.getenv("BOT_TOKEN")
-ADMIN_ID =   os.getenv("ADMIN_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("Не заданы переменные окружения BOT_TOKEN или ADMIN_ID")
@@ -23,9 +27,56 @@ try:
 except ValueError:
     raise ValueError("ADMIN_ID должен быть числом")
 
+# ========== Работа с пользователями (JSON) ==========
+USERS_FILE = "users.json"
+
+def load_users() -> Dict[int, Dict[str, Any]]:
+    """Загружает список пользователей из JSON-файла."""
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Преобразуем ключи в int
+            return {int(k): v for k, v in data.items()}
+    return {}
+
+def save_users(users: Dict[int, Dict[str, Any]]):
+    """Сохраняет список пользователей в JSON-файл."""
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+def add_user(user_id: int, username: str = None, first_name: str = None):
+    """Добавляет или обновляет информацию о пользователе."""
+    users = load_users()
+    if user_id not in users:
+        users[user_id] = {
+            "id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "first_seen": datetime.now().isoformat()
+        }
+    else:
+        # Обновляем имя/юзернейм, если они изменились
+        if username:
+            users[user_id]["username"] = username
+        if first_name:
+            users[user_id]["first_name"] = first_name
+    save_users(users)
+
+def get_user_by_username(username: str) -> Optional[int]:
+    """Возвращает ID пользователя по username (без @)."""
+    users = load_users()
+    username = username.lower().lstrip('@')
+    for uid, data in users.items():
+        if data.get("username") and data["username"].lower() == username:
+            return uid
+    return None
+
+def get_all_users() -> list[int]:
+    """Возвращает список всех ID пользователей."""
+    return list(load_users().keys())
+
 # ========== Хранилище времени последней заявки ==========
-# (в реальном проекте лучше использовать БД, но для демо хватит памяти)
-user_last_request = {}
+user_last_request: Dict[int, datetime] = {}
 
 def can_send_request(user_id: int) -> tuple[bool, str]:
     """Проверяет, можно ли отправить заявку (не чаще 1 раза в 6 часов)"""
@@ -60,12 +111,27 @@ reply_keyboard = ReplyKeyboardMarkup(
 class SellRobux(StatesGroup):
     waiting_for_amount = State()
 
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()   # ожидание текста для рассылки
+
+# ========== Глобальное состояние активного чата админа ==========
+# Для одного админа храним ID пользователя, с которым идёт диалог (или None)
+active_admin_chat: Optional[int] = None
+
 # ========== Роутер и обработчики ==========
 router = Router()
 
+# ----- Вспомогательные функции для проверки админа -----
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+# ----- Обработчик команды /start -----
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     """Приветственное сообщение с информацией и кнопкой"""
+    user = message.from_user
+    add_user(user.id, user.username, user.first_name)
+
     text = (
         "👋 Привет! Меня зовут Kotonaft15.\n"
         "Я продавец на FunPay и готов помочь вам обналичить игровую валюту в реальные деньги.\n\n"
@@ -78,16 +144,23 @@ async def cmd_start(message: Message):
     )
     await message.answer(text, reply_markup=reply_keyboard)
 
+# ----- Обработчик кнопки "ПРОДАТЬ РОБУКСЫ" -----
 @router.message(F.text == "📢 ПРОДАТЬ РОБУКСЫ")
 async def sell_button(message: Message, state: FSMContext):
     """Нажатие кнопки — начало процесса продажи"""
+    user = message.from_user
+    add_user(user.id, user.username, user.first_name)
+
     await message.answer("Введите количество Robux, которое вы готовы продать (минимум 10):")
     await state.set_state(SellRobux.waiting_for_amount)
 
+# ----- Обработчик ввода количества Robux -----
 @router.message(SellRobux.waiting_for_amount)
 async def process_amount(message: Message, state: FSMContext):
     """Обработка введённого количества"""
     user_id = message.from_user.id
+    user = message.from_user
+    add_user(user.id, user.username, user.first_name)
 
     # Проверка на число
     try:
@@ -124,7 +197,6 @@ async def process_amount(message: Message, state: FSMContext):
     )
 
     # Сообщение администратору
-    user = message.from_user
     user_link = f"@{user.username}" if user.username else f"<a href='tg://user?id={user.id}'>пользователь</a>"
 
     admin_text = (
@@ -144,6 +216,199 @@ async def process_amount(message: Message, state: FSMContext):
 
     # Завершаем состояние
     await state.clear()
+
+# ----- Обработчик команд администратора -----
+@router.message(Command("all"))
+async def cmd_broadcast(message: Message, state: FSMContext):
+    """Начало рассылки всем пользователям (только для админа)"""
+    if not is_admin(message.from_user.id):
+        return
+
+    # Если админ сейчас в активном чате, рассылка не прерывает его
+    await message.answer("Введите текст для рассылки всем пользователям:")
+    await state.set_state(AdminStates.waiting_for_broadcast)
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    """Отправка введённого текста всем пользователям"""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = message.text
+    if not text:
+        await message.answer("Сообщение не может быть пустым. Попробуйте ещё раз или отмените командой /cancel.")
+        return
+
+    users = get_all_users()
+    if not users:
+        await message.answer("Список пользователей пуст.")
+        await state.clear()
+        return
+
+    await message.answer(f"Начинаю рассылку {len(users)} пользователям...")
+
+    success = 0
+    failed = 0
+    for uid in users:
+        try:
+            await message.bot.send_message(uid, text)
+            success += 1
+            # Небольшая задержка, чтобы избежать флуда
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота — можно удалить из списка, но пока просто пропускаем
+            failed += 1
+        except TelegramRetryAfter as e:
+            # Превышение лимитов — ждём
+            await asyncio.sleep(e.retry_after)
+            # Повторим ещё раз (упрощённо)
+            try:
+                await message.bot.send_message(uid, text)
+                success += 1
+            except:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    await message.answer(f"✅ Рассылка завершена.\nУспешно: {success}\nНе удалось: {failed}")
+    await state.clear()
+
+@router.message(Command("chat"))
+async def cmd_chat(message: Message):
+    """Начать диалог с пользователем (только для админа)"""
+    if not is_admin(message.from_user.id):
+        return
+
+    global active_admin_chat
+
+    # Если уже есть активный чат, предложим завершить его сначала
+    if active_admin_chat is not None:
+        await message.answer("⚠️ У вас уже есть активный чат. Сначала завершите его командой /end.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Укажите пользователя: /chat <username или id>")
+        return
+
+    target = args[1].strip()
+    user_id = None
+
+    # Пытаемся определить ID
+    if target.isdigit():
+        user_id = int(target)
+        # Проверим, есть ли такой пользователь в нашей БД
+        users = load_users()
+        if user_id not in users:
+            # Всё равно попробуем отправить сообщение, но если бот не может писать первым — не получится
+            pass
+    else:
+        # Поиск по username
+        user_id = get_user_by_username(target)
+        if user_id is None:
+            await message.answer("Пользователь с таким username не найден в базе.")
+            return
+
+    if user_id == ADMIN_ID:
+        await message.answer("Нельзя начать чат с самим собой.")
+        return
+
+    # Проверим, может ли бот отправить сообщение этому пользователю (т.е. есть ли диалог)
+    try:
+        # Отправляем служебное сообщение, чтобы инициировать диалог
+        await message.bot.send_message(
+            user_id,
+            "👤 Администратор начал с вами диалог. Теперь вы можете общаться через этого бота. Напишите ваше сообщение."
+        )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить сообщение пользователю. Возможно, он не начинал диалог с ботом. Ошибка: {e}")
+        return
+
+    # Всё хорошо, устанавливаем активный чат
+    active_admin_chat = user_id
+
+    # Получаем информацию о пользователе для красивого ответа админу
+    users = load_users()
+    user_info = users.get(user_id, {})
+    name = user_info.get("first_name") or user_info.get("username") or str(user_id)
+    await message.answer(f"✅ Чат с пользователем {name} (ID: {user_id}) начат. Все ваши следующие сообщения будут пересылаться ему. Для завершения используйте /end.")
+
+@router.message(Command("end"))
+async def cmd_end(message: Message):
+    """Завершить текущий диалог (только для админа)"""
+    if not is_admin(message.from_user.id):
+        return
+
+    global active_admin_chat
+    if active_admin_chat is None:
+        await message.answer("Нет активного чата.")
+        return
+
+    # Уведомляем пользователя о завершении
+    try:
+        await message.bot.send_message(
+            active_admin_chat,
+            "🔚 Администратор завершил диалог. Если у вас остались вопросы, вы можете снова отправить заявку через кнопку."
+        )
+    except Exception:
+        pass  # Если не удалось, ничего страшного
+
+    active_admin_chat = None
+    await message.answer("✅ Чат завершён.")
+
+# ----- Основной обработчик сообщений (пересылка, если активен чат) -----
+@router.message()
+async def handle_all_messages(message: Message, state: FSMContext):
+    """Обрабатывает все сообщения, не попавшие в другие хэндлеры."""
+    user_id = message.from_user.id
+    global active_admin_chat
+
+    # Добавляем пользователя в базу при любом сообщении (на всякий случай)
+    add_user(user_id, message.from_user.username, message.from_user.first_name)
+
+    # Сообщения от админа
+    if is_admin(user_id):
+        # Проверяем, не находится ли админ в состоянии ожидания ввода (например, рассылки)
+        current_state = await state.get_state()
+        if current_state is not None:
+            # Если админ в каком-то состоянии (например, waiting_for_broadcast), не пересылаем, а даём обработать state
+            # Но state уже обработается в соответствующем хэндлере выше.
+            # Здесь просто ничего не делаем, потому что сообщение уже будет обработано хэндлером с состоянием.
+            return
+
+        # Если админ не в состоянии и есть активный чат, пересылаем сообщение пользователю
+        if active_admin_chat is not None:
+            # Пересылаем текст, фото, документы и т.д.
+            try:
+                # Копируем сообщение (можно просто переслать, но тогда будет видно, что переслано от бота)
+                # Лучше отправить как новое сообщение с текстом, чтобы пользователь видел, что пишет админ.
+                await message.copy_to(active_admin_chat)
+            except Exception as e:
+                await message.answer(f"❌ Не удалось отправить сообщение пользователю: {e}")
+                # Возможно, пользователь заблокировал бота — завершим чат
+                active_admin_chat = None
+                await message.answer("⚠️ Чат завершён из-за ошибки отправки.")
+        else:
+            # Нет активного чата, игнорируем обычные сообщения от админа
+            # (можно добавить подсказку)
+            await message.answer("Используйте команды /chat, /all, /end или начните диалог с пользователем.")
+        return
+
+    # Сообщения от обычного пользователя
+    # Если есть активный чат и это тот самый пользователь, пересылаем админу
+    if active_admin_chat == user_id:
+        try:
+            await message.copy_to(ADMIN_ID)
+        except Exception as e:
+            # Не удалось отправить админу — возможно, проблемы с ботом, но это маловероятно
+            logging.error(f"Не удалось переслать сообщение админу: {e}")
+    else:
+        # Пользователь не в активном чате — обрабатываем как обычное сообщение,
+        # но оно может не подходить ни под один другой хэндлер (например, просто текст).
+        # Можно предложить использовать кнопку.
+        if not message.text or not message.text.startswith('/'):
+            await message.answer("Используйте кнопку «📢 ПРОДАТЬ РОБУКСЫ» для создания заявки.")
 
 # ========== Точка входа ==========
 async def main():
